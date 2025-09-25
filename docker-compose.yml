@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  # Your CrewAI RAG API service
+  rag-api:
+    build: . # Build the image from the Dockerfile in the current directory
+    container_name: crewai_rag_api
+    environment:
+      # Pass the DATABASE_URL to the API container.
+      # 'host.docker.internal' is a special DNS name that points to the host machine.
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@host.docker.internal:${DB_PORT}/${DB_NAME}
+    ports:
+      - "8000:8000"
+    # This allows the container to resolve 'host.docker.internal'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+
+  # The OpenWebUI frontend service
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    volumes:
+      - o
