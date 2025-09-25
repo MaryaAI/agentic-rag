@@ -1,0 +1,27 @@
+# Python envs / caches
+.venv
+venv
+__pycache__
+*.pyc
+
+# Git/IDE
+.git
+.vscode
+.idea
+
+# Big local artifacts
+wheelhouse
+models
+data
+datasets
+*.ckpt
+*.pt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node/build
+node_modules
+dist
+build
