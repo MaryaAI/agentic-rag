@@ -25,3 +25,8 @@ openinference-instrumentation-crewai
 openinference-instrumentation-litellm
 # Pin numpy to avoid conflicts
 numpy<2
+
+httpx>=0.24.0
+pydantic>=1.10
+
+
