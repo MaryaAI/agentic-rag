@@ -16,7 +16,7 @@ llama-index-retrievers-bm25
 #transformers
 #torch
 sentencepiece
-docling-ibm-models
+docling-ibm-models[mlx]
 fastapi
 uvicorn
 openinference-instrumentation-crewai
