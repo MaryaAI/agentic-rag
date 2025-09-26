@@ -1,0 +1,202 @@
+import os
+import logging
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+import uvicorn
+from dotenv import load_dotenv
+import httpx
+
+# --- Arize Phoenix Tracing Setup ---
+# This block configures the tracer to send data to your local Phoenix instance.
+# It should be at the very top of your application's entry point.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Use host.docker.internal for Docker container to access host services
+phoenix_host = os.getenv("PHOENIX_HOST", "host.docker.internal")
+phoenix_endpoint = f"http://{phoenix_host}:6006"
+os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = phoenix_endpoint
+
+try:
+    from phoenix.otel import register
+    tracer_provider = register(
+        project_name="default",
+        endpoint=f"{phoenix_endpoint}/v1/traces",
+        auto_instrument=True  # This automatically instruments CrewAI and other libraries
+    )
+    logging.info(f"✅ Arize Phoenix tracing successfully initialized for API server at {phoenix_endpoint}")
+except ImportError as e:
+    logging.warning(f"⚠️  Phoenix module not found: {e}. Install with: pip install arize-phoenix")
+except Exception as e:
+    logging.warning(f"⚠️  Could not initialize Arize Phoenix tracing: {e}")
+# --- End of Tracing Setup ---
+
+# Ensure the project root is in the Python path
+import sys
+project_root = os.path.abspath(os.path.dirname(__file__))
+sys.path.insert(0, project_root)
+
+# Import your existing crew creation function
+from src.rag_system.crew import create_rag_crew
+
+# Load environment variables
+load_dotenv()
+
+# Initialize the FastAPI app
+app = FastAPI(
+    title="CrewAI RAG API",
+    description="An API server for the agentic RAG pipeline.",
+    version="1.0.0",
+)
+
+# Add CORS middleware to allow requests from OpenWebUI
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
+
+# Define the request model to be compatible with OpenAI's format
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[Dict[str, str]]
+
+@app.get("/v1/models")
+def list_models():
+    """
+    OpenAI-compatible endpoint to list available models.
+    This is required for OpenWebUI to discover available models.
+    """
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "crew-ai-rag",
+                "object": "model", 
+                "created": 1677652288,
+                "owned_by": "crew-ai-rag",
+                "permission": [],
+                "root": "crew-ai-rag",
+                "parent": None,
+                "max_tokens": 131072,        # Updated to match gemma3:4b max tokens
+                "context_length": 131072     # Updated to match gemma3:4b context length
+            }
+        ]
+    }
+
+
+@app.post("/v1/chat/completions")
+def chat_completions(request: ChatCompletionRequest):
+    """
+    OpenAI-compatible endpoint. Behavior:
+      * If OPENAI_API_KEY is set or USE_OPENAI=1 -> call OpenAI Chat API and return that response.
+      * Otherwise -> run the existing CrewAI RAG workflow (create_rag_crew) and return compatible response.
+    This handler is defensive about message shape (accepts dict messages, falls back gracefully).
+    """
+    # robustly extract last user content
+    user_message = None
+    try:
+        for msg in reversed(request.messages or []):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get('role') or msg.get('type') or msg.get('sender')
+            content = msg.get('content') or msg.get('text') or msg.get('message')
+            if role == 'user' and content:
+                user_message = content
+                break
+        if not user_message:
+            # fallback: last content
+            for msg in reversed(request.messages or []):
+                if isinstance(msg, dict):
+                    content = msg.get('content') or msg.get('text') or msg.get('message')
+                    if content:
+                        user_message = content
+                        break
+    except Exception:
+        # If request.messages has unexpected shape, try a simple fallback
+        try:
+            user_message = request.messages[-1].get('content')
+        except Exception:
+            user_message = None
+
+    if not user_message:
+        return {"error": "No user message found"}
+
+    
+# Prefer OpenAI if configured
+from fastapi.encoders import jsonable_encoder
+openai_key = os.getenv("OPENAI_API_KEY")
+use_openai_flag = os.getenv("USE_OPENAI", "").strip()
+if openai_key or use_openai_flag == "1":
+    # Build safe serializable messages payload
+    try:
+        messages_serialized = jsonable_encoder(request.messages or [])
+        # ensure every item is a dict with role and content keys
+        cleaned_messages = []
+        for m in messages_serialized:
+            if isinstance(m, dict):
+                role = m.get("role") or m.get("type") or m.get("sender")
+                content = m.get("content") or m.get("text") or m.get("message")
+                if role and content:
+                    cleaned_messages.append({"role": role, "content": content})
+                elif content:
+                    # fallback to user content-only
+                    cleaned_messages.append({"role": "user", "content": content})
+            else:
+                # not a dict, convert to string
+                cleaned_messages.append({"role": "user", "content": str(m)})
+        # if cleaned_messages is empty, fall back to the single user_message we extracted earlier
+        if not cleaned_messages and user_message:
+            cleaned_messages = [{"role":"user","content":user_message}]
+    except Exception as e:
+        logging.exception("Failed to serialize messages for OpenAI: %s", e)
+        return JSONResponse(status_code=400, content={"error":"Bad messages payload","detail":str(e)})
+
+    model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+    payload = {
+        "model": model,
+        "messages": cleaned_messages,
+        "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "512")),
+        "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.0")),
+    }
+    headers = {
+        "Authorization": f"Bearer {openai_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        # call OpenAI
+        resp = httpx.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=60.0)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        logging.exception("OpenAI returned HTTP error: %s", e)
+        return JSONResponse(status_code=502, content={"error":"OpenAI HTTP error","detail":str(e)})
+    except Exception as e:
+        logging.exception("OpenAI request failed; not falling back to Crew/Ollama. Error: %s", e)
+        return JSONResponse(status_code=502, content={"error":"OpenAI request failed","detail":str(e)})
+# Fallback: run the existing Crew RAG flow
+    try:
+        rag_crew = create_rag_crew(user_message)
+        result = rag_crew.kickoff()
+        # Attempt to produce OpenAI-compatible response shape
+        return {
+            "id": "chatcmpl-crewai",
+            "object": "chat.completion",
+            "created": int(__import__('time').time()),
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": str(result)},
+                    "finish_reason": "stop"
+                }
+            ]
+        }
+    except Exception as e:
+        logging.exception("Crew fallback failed: %s", e)
+        return {"error": "internal server error", "detail": str(e)}
+
+if __name__ == "__main__":
+    # This allows you to run the API server directly for testing
+    uvicorn.run(app, host="0.0.0.0", port=8000)
