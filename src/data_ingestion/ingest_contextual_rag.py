@@ -1,403 +1,467 @@
 #!/usr/bin/env python3
 """
-Enhanced PGVector Indexing with Contextual RAG
-Implements Anthropic's Contextual Retrieval approach using LlamaIndex and Ollama
+Optimized Contextual RAG ingestion:
+ - batched embeddings
+ - fast bulk DB insertion (psycopg2.execute_values when available)
+ - detect & reconcile vector dimension mismatch (recreate table when necessary)
+ - robust embedder adapter resolution
+Save to: src/data_ingestion/ingest_contextual_rag.py
 """
 
+from __future__ import annotations
 import os
 import sys
-import logging
 import json
+import logging
 import copy
+import time
 from datetime import datetime
-from urllib.parse import quote_plus
-from typing import List, Dict, Any
+from typing import List, Iterable
 
 from sqlalchemy import create_engine, text
-from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, Settings
+from sqlalchemy.engine import Engine
+from llama_index.core import SimpleDirectoryReader, Settings
 from llama_index.core.node_parser import MarkdownNodeParser
 from llama_index.core.text_splitter import TokenTextSplitter
 from llama_index.core.ingestion import IngestionPipeline
-from llama_index.vector_stores.postgres import PGVectorStore
-from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.llms.ollama import Ollama
-from llama_index.core.llms import ChatMessage
-from llama_index.core.schema import Document, TextNode
-import asyncio
-import nest_asyncio
+from llama_index.core.schema import TextNode, Document
 
-# Configure logging
+import openai
+
+# Logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(f'contextual_rag_index_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-    ]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
-# --- Configuration ---
-MD_DIR = "/Users/kiwitech/Documents/agentic-rag-poc/data/processed/md"
+# ---------- Config (tweak these) ----------
+MD_DIR = os.getenv("MD_DIR", "data/raw")
 
-# Database configuration
-DB_HOST = "localhost"
-DB_PORT = 5432
-DB_NAME = "rag_db"
-DB_USER = "kiwitech"
-DB_PASSWORD = "zakirnagar"
-
-# Construct DATABASE_URL
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+DB_HOST = os.getenv("DB_HOST", os.getenv("DATABASE_HOST", "db"))
+DB_PORT = int(os.getenv("DB_PORT", os.getenv("DATABASE_PORT", "5432")))
+DB_NAME = os.getenv("DB_NAME", "rag_db")
+DB_USER = os.getenv("DB_USER", "rag_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "rag_password")
+DATABASE_URL = os.getenv("DATABASE_URL", f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
 TABLE_NAME = "doc_md_contextual_20250830"
-EMBED_DIM = 768
+TABLE_FULLNAME = f"data_{TABLE_NAME}"
 
-# Contextual RAG Configuration
-CONTEXT_LLM_MODEL = "gemma3:4b"
-OLLAMA_BASE_URL = "http://localhost:11434"
+# OpenAI / embeddings
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "128"))
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.0"))
 
-# Prompts for contextual retrieval
-CONTEXT_PROMPT_TEMPLATE = """You are analyzing a procurement policy document. Your task is to provide context for a specific chunk.
+# Operational
+BATCH_SIZE = int(os.getenv("INGEST_BATCH_SIZE", "32"))  # batch size for embeddings & DB inserts
+NON_DESTRUCTIVE = os.getenv("INGEST_NON_DESTRUCTIVE", "false").lower() in ("1", "true", "yes")
 
-<document>
-{WHOLE_DOCUMENT}
-</document>
+# set openai key if provided
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
-<chunk>
-{CHUNK_CONTENT}
-</chunk>
+# ---------- helpers ----------
+def _retry_backoff(fn, attempts: int = 4, base: float = 1.5):
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if i + 1 == attempts:
+                raise
+            wait = base ** i
+            logger.warning("Transient error (attempt %d/%d): %s — retrying in %.1fs", i+1, attempts, e, wait)
+            time.sleep(wait)
 
-Provide a brief context (1-2 sentences) explaining:
-1. Which section/topic this chunk relates to
-2. How it connects to the overall procurement process
-3. Its relationship to other procedures
+# Chat completion wrapper that prefers the new client shape but falls back to older API.
+def chat_completion_text(model: str, messages: List[dict], max_tokens: int, temperature: float) -> str:
+    # try new client style
+    NewClient = getattr(openai, "OpenAI", None)
+    if NewClient:
+        try:
+            client = NewClient()
+            resp = client.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+            # try to read the common shapes
+            try:
+                return resp.choices[0].message["content"].strip()
+            except Exception:
+                return resp.choices[0].message.content.strip()
+        except Exception:
+            # fall through to old api
+            pass
+    # old fallback
+    resp = openai.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+    return resp["choices"][0]["message"]["content"].strip()
 
-Respond with only the context, nothing else."""
+def chunked_iter(seq: List, n: int) -> Iterable[List]:
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
 
-def check_database_connection():
-    """Test database connectivity and check for pgvector extension"""
+# ---------- embedding adapter resolution ----------
+def resolve_embedder() -> object:
+    # If Settings.embed_model is preconfigured, use it.
+    if getattr(Settings, "embed_model", None):
+        logger.info("Using preconfigured Settings.embed_model")
+        return Settings.embed_model
+
+    # Try to import runtime BaseEmbedding class so our adapter will be isinstance-compatible
+    runtime_base = None
+    for candidate in ("llama_index.core.embeddings.base", "llama_index.embeddings.base"):
+        try:
+            m = __import__(candidate, fromlist=["BaseEmbedding"])
+            runtime_base = getattr(m, "BaseEmbedding")
+            logger.debug("Found BaseEmbedding in %s", candidate)
+            break
+        except Exception:
+            continue
+
+    # Build an OpenAI adapter that subclasses runtime_base if available
+    class _OpenAIAdapter:
+        def __init__(self, model_name: str = None):
+            self.model_name = model_name or OPENAI_EMBEDDING_MODEL
+        def embed_documents(self, texts: List[str]) -> List[List[float]]:
+            if not isinstance(texts, (list, tuple)):
+                texts = [texts]
+            def call():
+                resp = openai.Embedding.create(model=self.model_name, input=texts)
+                return [item["embedding"] for item in resp["data"]]
+            return _retry_backoff(call, attempts=3, base=2.0)
+        def embed_query(self, text: str) -> List[float]:
+            def call():
+                resp = openai.Embedding.create(model=self.model_name, input=text)
+                return resp["data"][0]["embedding"]
+            return _retry_backoff(call, attempts=3, base=2.0)
+
+    if runtime_base:
+        # create a subclass at runtime
+        AdapterClass = type("OpenAIEmbeddingRuntimeAdapter", (runtime_base, _OpenAIAdapter), {})
+        return AdapterClass()
+    else:
+        return _OpenAIAdapter()
+
+# ---------- document/context processing ----------
+def generate_chunk_context_openai(chunk_text: str, max_lines: int = 2) -> str:
+    prompt = f"""Summarize this text in {max_lines} short lines that capture the key information and intent.
+
+Text:
+{chunk_text}
+
+Summary ({max_lines} lines only):"""
+    def call():
+        content = chat_completion_text(model=os.getenv("OPENAI_CHAT_MODEL", OPENAI_MODEL),
+                                      messages=[{"role": "user", "content": prompt}],
+                                      max_tokens=OPENAI_MAX_TOKENS,
+                                      temperature=OPENAI_TEMPERATURE)
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        return "\n".join(lines[:max_lines]) if lines else ""
     try:
-        logger.info(f"Testing connection to database: {DB_NAME} at {DB_HOST}:{DB_PORT}")
-        
-        engine = create_engine(DATABASE_URL)
-        
-        with engine.connect() as conn:
-            # Test basic connection
-            result = conn.execute(text("SELECT version()"))
-            version = result.fetchone()[0]
-            logger.info(f"✅ PostgreSQL connected: {version}")
-            
-            # Check pgvector extension
-            result = conn.execute(text("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')"))
-            has_pgvector = result.fetchone()[0]
-            
-            if has_pgvector:
-                logger.info("✅ pgvector extension is installed")
-            else:
-                logger.error("❌ pgvector extension not found")
-                return False
-                
-            return True
-            
+        return _retry_backoff(call, attempts=3, base=2.0)
     except Exception as e:
-        logger.error(f"❌ Database connection failed: {e}")
-        return False
-
-def test_ollama_connection():
-    """Test Ollama service connectivity and model availability"""
-    try:
-        import requests
-        
-        # Test Ollama service
-        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
-        if response.status_code != 200:
-            logger.error(f"❌ Ollama service not accessible at {OLLAMA_BASE_URL}")
-            return False
-        
-        # Check if required models are available
-        models = response.json().get('models', [])
-        model_names = [model['name'] for model in models]
-        
-        required_models = [CONTEXT_LLM_MODEL, "nomic-embed-text:v1.5"]
-        missing_models = [model for model in required_models if model not in model_names]
-        
-        if missing_models:
-            logger.error(f"❌ Missing Ollama models: {missing_models}")
-            logger.info(f"Available models: {model_names}")
-            return False
-        
-        logger.info(f"✅ Ollama connected with required models: {required_models}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Ollama connection failed: {e}")
-        return False
-
-def clear_existing_table():
-    """Clear existing table data"""
-    try:
-        logger.info(f"Clearing existing data from table: {TABLE_NAME}")
-        engine = create_engine(DATABASE_URL)
-        
-        with engine.connect() as conn:
-            # Check if table exists
-            result = conn.execute(text(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = 'data_{TABLE_NAME}'
-                )
-            """))
-            table_exists = result.fetchone()[0]
-            
-            if table_exists:
-                # Clear the table
-                conn.execute(text(f"DELETE FROM data_{TABLE_NAME}"))
-                conn.commit()
-                logger.info(f"✅ Cleared table data_{TABLE_NAME}")
-            else:
-                logger.info(f"Table data_{TABLE_NAME} doesn't exist yet - will be created")
-                
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to clear table: {e}")
-        return False
+        logger.warning("OpenAI context generation failed: %s", e)
+        return "Document chunk containing policy text.\nRelevant for organizational procedures."
 
 def extract_page_number_from_text(text: str, chunk_index: int) -> int:
-    """Extract page number from text content or estimate based on chunk position"""
-    # Simple heuristic: assume ~2000 characters per page
-    # You can enhance this by looking for page markers in markdown
-    estimated_page = max(1, (chunk_index * 800) // 2000 + 1)  # 800 chars per chunk, 2000 per page
-    return estimated_page
+    return max(1, (chunk_index * 800) // 2000 + 1)
 
 def create_contextual_nodes(nodes: List[TextNode], whole_document: str) -> List[TextNode]:
-    """Create contextual nodes using Ollama LLM"""
-    logger.info(f"Creating contextual nodes for {len(nodes)} chunks...")
-    
-    # Initialize LLM for context generation
-    context_llm = Ollama(
-        model=CONTEXT_LLM_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        request_timeout=120.0
-    )
-    
+    logger.info("Creating contextual nodes for %d chunks...", len(nodes))
     enhanced_nodes = []
-    
     for i, node in enumerate(nodes):
-        try:
-            # Create a deep copy of the node
-            enhanced_node = copy.deepcopy(node)
-            
-            # Generate context using LLM
-            context_prompt = CONTEXT_PROMPT_TEMPLATE.format(
-                WHOLE_DOCUMENT=whole_document[:8000],  # Limit document size for context
-                CHUNK_CONTENT=node.text
-            )
-            
-            # Get context from LLM
-            context_response = context_llm.complete(context_prompt)
-            context = str(context_response).strip()
-            
-            # Add context to metadata
-            enhanced_node.metadata["context"] = context
-            
-            # Add page number estimation
-            page_num = extract_page_number_from_text(node.text, i)
-            enhanced_node.metadata["page_number"] = page_num
-            
-            enhanced_nodes.append(enhanced_node)
-            
-            # Log progress every 50 nodes
-            if (i + 1) % 50 == 0:
-                logger.info(f"Generated context for {i + 1}/{len(nodes)} nodes")
-                
-        except Exception as e:
-            logger.warning(f"Failed to generate context for node {i}: {e}")
-            # Fallback: use original node with page number
-            fallback_node = copy.deepcopy(node)
-            fallback_node.metadata["context"] = f"Part of {node.metadata.get('file_name', 'document')}"
-            fallback_node.metadata["page_number"] = extract_page_number_from_text(node.text, i)
-            enhanced_nodes.append(fallback_node)
-    
-    logger.info(f"✅ Created {len(enhanced_nodes)} contextual nodes")
+        enhanced_node = copy.deepcopy(node)
+        context = None
+        if OPENAI_API_KEY:
+            try:
+                context = generate_chunk_context_openai(node.text, max_lines=2)
+            except Exception as e:
+                logger.warning("Context generation failed for node %d: %s", i, e)
+                context = None
+        if not context:
+            context = f"Part of {node.metadata.get('file_name', 'document')}"
+        enhanced_node.metadata = dict(enhanced_node.metadata or {})
+        enhanced_node.metadata["context"] = context
+        enhanced_node.metadata["page_number"] = extract_page_number_from_text(node.text, i)
+        enhanced_nodes.append(enhanced_node)
+        if (i + 1) % 50 == 0:
+            logger.info("Generated context for %d/%d nodes", i+1, len(nodes))
+    logger.info("✅ Created %d contextual nodes", len(enhanced_nodes))
     return enhanced_nodes
 
-def load_documents():
-    """Load markdown documents from the directory"""
-    try:
-        logger.info(f"Loading documents from: {MD_DIR}")
-        
-        if not os.path.exists(MD_DIR):
-            logger.error(f"❌ Directory not found: {MD_DIR}")
-            return None
-        
-        # Load documents
-        reader = SimpleDirectoryReader(input_dir=MD_DIR, recursive=True)
-        documents = reader.load_data()
-        
-        logger.info(f"✅ Loaded {len(documents)} documents")
-        
-        # Log document info
-        for doc in documents:
-            file_name = doc.metadata.get('file_name', 'Unknown')
-            text_length = len(doc.text)
-            logger.info(f"Document: {file_name}, Length: {text_length:,} characters")
-        
-        return documents
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to load documents: {e}")
-        return None
+# ---------- DB helpers ----------
+def make_engine(url: str) -> Engine:
+    return create_engine(url, pool_pre_ping=True)
 
+def ensure_table_with_dim(engine: Engine, table: str, dim: int, drop_if_mismatch: bool = True) -> None:
+    """Ensure public.{table} exists and embedding is vector(dim). If exists with mismatch:
+       - if drop_if_mismatch True -> drop & recreate
+       - else raise RuntimeError
+    """
+    with engine.begin() as conn:
+        # detect existence
+        exists = bool(conn.execute(text("SELECT to_regclass(:name)"), {"name": f"public.{table}"}).fetchone()[0])
+        if exists:
+            # try to inspect pg_type/format_type for embedding column
+            existing_dim = None
+            try:
+                q = text("""
+                    SELECT pg_catalog.col_description(c.oid, a.attnum) as col_comment,
+                           format_type(a.atttypid, a.atttypmod) as type_repr
+                    FROM pg_attribute a
+                    JOIN pg_class c ON a.attrelid = c.oid
+                    WHERE c.relname = :tbl AND a.attname = 'embedding' AND a.attnum > 0;
+                """)
+                r = conn.execute(q, {"tbl": table}).fetchone()
+                if r and r["type_repr"]:
+                    import re
+                    m = re.search(r"vector\s*\(\s*(\d+)\s*\)", r["type_repr"])
+                    if m:
+                        existing_dim = int(m.group(1))
+            except Exception:
+                existing_dim = None
+
+            if existing_dim is None:
+                # fallback: try to query the column definition via information_schema (best-effort)
+                try:
+                    q2 = text("""
+                        SELECT udt_name
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = :tbl AND column_name = 'embedding'
+                    """)
+                    r2 = conn.execute(q2, {"tbl": table}).fetchone()
+                    if r2 and r2[0] and 'vector' in r2[0]:
+                        # may not contain dimension
+                        existing_dim = None
+                except Exception:
+                    existing_dim = None
+
+            if existing_dim is not None and existing_dim != dim:
+                msg = f"Existing table public.{table} has vector dim={existing_dim} but model emits {dim}"
+                if not drop_if_mismatch:
+                    raise RuntimeError(msg)
+                logger.warning(msg + " — dropping & recreating table.")
+                conn.execute(text(f"DROP TABLE IF EXISTS public.{table} CASCADE"))
+                exists = False
+            elif existing_dim is None:
+                # unknown existing dim: to be safe, drop & recreate
+                if not drop_if_mismatch:
+                    raise RuntimeError("Existing table found but could not determine embedding dimension; enable drop_if_mismatch to allow recreate")
+                logger.info("Existing table found but dimension unknown — dropping & recreating to be safe.")
+                conn.execute(text(f"DROP TABLE IF EXISTS public.{table} CASCADE"))
+                exists = False
+            else:
+                logger.info("Existing table public.%s already matches embedding dim=%d", table, dim)
+
+        if not exists:
+            create_sql = f"""
+            CREATE TABLE public.{table} (
+                id bigserial PRIMARY KEY,
+                doc_id text,
+                text_content text,
+                metadata jsonb,
+                embedding vector({dim}),
+                created_at timestamptz DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS {table}_embedding_idx ON public.{table} USING ivfflat (embedding);
+            """
+            conn.execute(text(create_sql))
+            logger.info("✅ Ensured table public.%s exists (vector dim=%d)", table, dim)
+
+# ---------- Main ----------
 def main():
-    """Main indexing function with contextual RAG"""
-    logger.info("="*80)
-    logger.info("Starting Contextual RAG PGVector Indexing Process")
-    logger.info("="*80)
-    
-    # Step 1: Check database connection
-    if not check_database_connection():
-        logger.error("Aborting: Database connection issues")
-        return
-    
-    # Step 2: Check Ollama
-    if not test_ollama_connection():
-        logger.error("Aborting: Ollama connection issues")
-        return
-    
-    # Step 3: Clear existing table
-    if not clear_existing_table():
-        logger.error("Aborting: Failed to clear existing table")
-        return
-    
-    # Step 4: Load documents
-    documents = load_documents()
-    if not documents:
-        logger.error("Aborting: No documents to index")
-        return
-    
+    logger.info("=== Contextual RAG ingest starting ===")
+    # DB connection check
+    engine = make_engine(DATABASE_URL)
     try:
-        # Step 5: Configure embedding model
-        logger.info("Configuring embedding model...")
-        Settings.embed_model = OllamaEmbedding(
-            model_name="nomic-embed-text:v1.5",
-            base_url=OLLAMA_BASE_URL,
-        )
-        
-        # Step 6: Create vector store
-        logger.info("Creating vector store...")
-        vector_store = PGVectorStore.from_params(
-            database=DB_NAME,
-            host=DB_HOST,
-            port=DB_PORT,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            table_name=TABLE_NAME,
-            embed_dim=EMBED_DIM,
-            hybrid_search=True,
-            text_search_config="english",
-            hnsw_kwargs={
-                "hnsw_m": 16,
-                "hnsw_ef_construction": 64,
-                "hnsw_ef_search": 40,
-                "hnsw_dist_method": "vector_cosine_ops"
-            }
-        )
-        logger.info("✅ Vector store created")
-        
-        # Step 7: Use async parallel processing for optimal performance
-        logger.info("🚀 Setting up async parallel processing for contextual enhancement...")
-        
-        # Enable async processing
-        nest_asyncio.apply()
-        
-        # Process all documents with optimized async approach
-        all_enhanced_nodes = []
-        
-        async def process_documents_async():
-            """Async function to process documents with parallel contextual enhancement"""
-            
-            # Create ingestion pipeline for standard processing
-            pipeline = IngestionPipeline(
-                transformations=[
-                    MarkdownNodeParser(include_metadata=True),
-                    TokenTextSplitter(
-                        chunk_size=800,
-                        chunk_overlap=200,
-                        separator=" "
-                    ),
-                    Settings.embed_model,  # Embedding generation
-                ]
-            )
-            
-            all_nodes = []
-            
-            for doc_idx, document in enumerate(documents):
-                logger.info(f"Processing document {doc_idx + 1}/{len(documents)}: {document.metadata.get('file_name', 'Unknown')}")
-                
-                # Run async parallel processing for chunking and embedding
-                processed_nodes = await pipeline.arun(documents=[document], num_workers=4)
-                
-                # Apply contextual enhancement to processed nodes
-                enhanced_nodes = create_contextual_nodes(processed_nodes, document.text)
-                all_nodes.extend(enhanced_nodes)
-                
-                logger.info(f"✅ Processed document {doc_idx + 1} with {len(enhanced_nodes)} enhanced chunks using async pipeline")
-            
-            return all_nodes
-        
-        # Run the async processing
-        loop = asyncio.get_event_loop()
-        all_enhanced_nodes = loop.run_until_complete(process_documents_async())
-        
-        # Step 8: Create index and add all enhanced nodes
-        logger.info(f"Creating vector store index and adding {len(all_enhanced_nodes)} enhanced nodes...")
-        index = VectorStoreIndex.from_vector_store(
-            vector_store=vector_store,
-            embed_model=Settings.embed_model,
-        )
-        
-        # Add nodes to the index in batches
-        batch_size = 100
-        for i in range(0, len(all_enhanced_nodes), batch_size):
-            batch = all_enhanced_nodes[i:i + batch_size]
-            index.insert_nodes(batch)
-            logger.info(f"Progress: {min(i + batch_size, len(all_enhanced_nodes))}/{len(all_enhanced_nodes)} nodes inserted")
-        
-        logger.info(f"✅ All {len(all_enhanced_nodes)} enhanced nodes inserted")
-        
-        # Step 9: Verify indexing
-        logger.info("Verifying indexed data...")
-        engine = create_engine(DATABASE_URL)
-        
         with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM data_{TABLE_NAME}"))
-            total_count = result.fetchone()[0]
-            logger.info(f"✅ Total indexed chunks: {total_count}")
-            
-            # Check contextual metadata
-            result = conn.execute(text(f"""
-                SELECT 
-                    COUNT(*) as total,
-                    COUNT(CASE WHEN metadata_->>'context' IS NOT NULL THEN 1 END) as with_context,
-                    COUNT(CASE WHEN metadata_->>'page_number' IS NOT NULL THEN 1 END) as with_page_num
-                FROM data_{TABLE_NAME}
-            """))
-            stats = result.fetchone()
-            logger.info(f"✅ Chunks with context: {stats[1]}/{stats[0]}")
-            logger.info(f"✅ Chunks with page numbers: {stats[2]}/{stats[0]}")
-        
-        logger.info("="*80)
-        logger.info("🎉 CONTEXTUAL RAG INDEXING COMPLETED SUCCESSFULLY!")
-        logger.info(f"📊 Enhanced {len(all_enhanced_nodes)} chunks with contextual information")
-        logger.info(f"🔍 Table: data_{TABLE_NAME}")
-        logger.info(f"🧠 Context LLM: {CONTEXT_LLM_MODEL}")
-        logger.info("="*80)
-        
+            version = conn.execute(text("SELECT version()")).fetchone()[0]
+            logger.info("Connected to DB: %s", version)
+            has_vec = conn.execute(text("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')")).fetchone()[0]
+            if not has_vec:
+                logger.error("pgvector extension not found in DB — aborting.")
+                return
     except Exception as e:
-        logger.error(f"❌ Indexing failed: {e}")
-        raise
+        logger.exception("Database connection failed: %s", e)
+        return
+
+    # Load documents
+    if not os.path.exists(MD_DIR):
+        logger.error("MD_DIR not found: %s", MD_DIR)
+        return
+    reader = SimpleDirectoryReader(input_dir=MD_DIR, recursive=True)
+    documents: List[Document] = reader.load_data()
+    if not documents:
+        logger.error("No documents loaded from %s", MD_DIR)
+        return
+    logger.info("Loaded %d documents", len(documents))
+
+    # Build pipeline & nodes
+    pipeline = IngestionPipeline(transformations=[
+        MarkdownNodeParser(include_metadata=True),
+        TokenTextSplitter(chunk_size=800, chunk_overlap=200),
+    ])
+    all_nodes: List[TextNode] = []
+    for d in documents:
+        if hasattr(pipeline, "create_nodes_from_document"):
+            nodes = pipeline.create_nodes_from_document(d)
+        elif hasattr(pipeline, "create_nodes"):
+            nodes = pipeline.create_nodes(d)
+        else:
+            # fallback
+            from llama_index.core.schema import TextNode as LITextNode
+            nodes = [LITextNode(text=d.text, metadata=d.metadata)]
+        all_nodes.extend(nodes)
+    logger.info("Split into %d nodes", len(all_nodes))
+
+    # Generate contextual metadata
+    enhanced_nodes = create_contextual_nodes(all_nodes, whole_document=" ".join([d.text for d in documents])[:8000])
+    if not enhanced_nodes:
+        logger.info("No nodes after contextualization — exiting.")
+        return
+
+    # Resolve embedder
+    embedder = resolve_embedder()
+
+    # batched embedding compute helper
+    def compute_embeddings_for_texts(texts: List[str]) -> List[List[float]]:
+        # prefer adapter embed_documents if available
+        if hasattr(embedder, "embed_documents"):
+            return embedder.embed_documents(texts)
+        # fallback to per-text embed_query/get_text_embedding
+        out = []
+        for t in texts:
+            if hasattr(embedder, "embed_query"):
+                out.append(embedder.embed_query(t))
+            elif hasattr(embedder, "get_text_embedding"):
+                out.append(embedder.get_text_embedding(t))
+            else:
+                resp = openai.Embedding.create(model=OPENAI_EMBEDDING_MODEL, input=t)
+                out.append(resp["data"][0]["embedding"])
+        return out
+
+    # Compute first batch to detect dimension
+    first_batch_texts = [n.text for n in enhanced_nodes[:BATCH_SIZE]]
+    logger.info("Computing embeddings for initial batch (size=%d)...", len(first_batch_texts))
+    first_embeddings = []
+    for batch in chunked_iter(first_batch_texts, BATCH_SIZE):
+        first_embeddings.extend(compute_embeddings_for_texts(batch))
+    if not first_embeddings or not isinstance(first_embeddings[0], (list, tuple)):
+        logger.error("Failed to compute embeddings for the first batch")
+        return
+    detected_dim = len(first_embeddings[0])
+    logger.info("Detected embedding dimension: %d", detected_dim)
+
+    # Ensure DB table (and reconcile dim mismatch)
+    try:
+        ensure_table_with_dim(engine, TABLE_FULLNAME, detected_dim, drop_if_mismatch=not NON_DESTRUCTIVE)
+    except Exception as e:
+        logger.exception("Failed ensuring table with right dimension: %s", e)
+        return
+
+    # Try to import psycopg2 for fast bulk insert
+    use_psycopg2 = False
+    try:
+        import psycopg2
+        import psycopg2.extras as pg_extras
+        use_psycopg2 = True
+        logger.info("psycopg2 available: will use fast bulk insert (execute_values).")
+    except Exception:
+        logger.info("psycopg2 not available: falling back to SQLAlchemy batch inserts (slower).")
+
+    total_inserted = 0
+
+    if use_psycopg2:
+        # bulk insert using psycopg2.execute_values with template that casts embedding to vector
+        conn_info = {
+            "dbname": DB_NAME,
+            "user": DB_USER,
+            "password": DB_PASSWORD,
+            "host": DB_HOST,
+            "port": DB_PORT,
+        }
+        try:
+            pg_conn = psycopg2.connect(**conn_info)
+            pg_cur = pg_conn.cursor()
+            from psycopg2.extras import execute_values
+
+            # function to produce rows
+            def rows_for_batch(nodes_batch, embeddings_batch):
+                rows = []
+                for node, emb in zip(nodes_batch, embeddings_batch):
+                    metadata_json = json.dumps(node.metadata or {})
+                    emb_text = '[' + ','.join(map(str, emb)) + ']'
+                    doc_id_val = (node.metadata or {}).get("doc_id")
+                    rows.append((doc_id_val, node.text, metadata_json, emb_text))
+                return rows
+
+            # first batch already computed
+            start_idx = 0
+            batch_nodes = enhanced_nodes[:len(first_batch_texts)]
+            rows = rows_for_batch(batch_nodes, first_embeddings)
+            template = "(%s,%s,%s,CAST(%s AS vector))"
+            execute_values(pg_cur,
+                           f"INSERT INTO public.{TABLE_FULLNAME} (doc_id, text_content, metadata, embedding) VALUES %s",
+                           rows, template=template)
+            pg_conn.commit()
+            total_inserted += len(rows)
+            logger.info("Inserted initial batch of %d rows (psycopg2).", len(rows))
+
+            # remaining batches
+            for start in range(len(first_batch_texts), len(enhanced_nodes), BATCH_SIZE):
+                batch_nodes = enhanced_nodes[start:start+BATCH_SIZE]
+                texts = [n.text for n in batch_nodes]
+                embeddings = []
+                for b in chunked_iter(texts, BATCH_SIZE):
+                    embeddings.extend(compute_embeddings_for_texts(b))
+                rows = rows_for_batch(batch_nodes, embeddings)
+                execute_values(pg_cur,
+                               f"INSERT INTO public.{TABLE_FULLNAME} (doc_id, text_content, metadata, embedding) VALUES %s",
+                               rows, template=template)
+                pg_conn.commit()
+                total_inserted += len(rows)
+                logger.info("Inserted batch starting %d (%d rows).", start, len(rows))
+
+            pg_cur.close()
+            pg_conn.close()
+            logger.info("✅ Inserted %d rows into public.%s", total_inserted, TABLE_FULLNAME)
+        except Exception as e:
+            logger.exception("psycopg2 bulk insert failed: %s", e)
+            # fallback to SQLAlchemy below
+    if not use_psycopg2 or total_inserted == 0:
+        # Use SQLAlchemy insertion per-batch (parameterized + CAST)
+        with engine.begin() as conn:
+            # insert first batch (if not done)
+            def insert_batch_sqlalchemy(nodes_batch, embeddings_batch):
+                insert_sql = text(
+                    f"INSERT INTO public.{TABLE_FULLNAME} (doc_id, text_content, metadata, embedding) "
+                    f"VALUES (:doc_id, :text_content, :metadata, CAST(:embedding AS vector))"
+                )
+                for node, emb in zip(nodes_batch, embeddings_batch):
+                    metadata_json = json.dumps(node.metadata or {})
+                    emb_text = '[' + ','.join(map(str, emb)) + ']'
+                    doc_id_val = (node.metadata or {}).get('doc_id')
+                    conn.execute(insert_sql, {"doc_id": doc_id_val, "text_content": node.text, "metadata": metadata_json, "embedding": emb_text})
+
+            # if first batch wasn't inserted by psycopg2, insert it now
+            if total_inserted == 0:
+                insert_batch_sqlalchemy(enhanced_nodes[:len(first_batch_texts)], first_embeddings)
+                total_inserted += len(first_batch_texts)
+                logger.info("Inserted initial batch of %d rows (SQLAlchemy).", len(first_batch_texts))
+
+            for start in range(len(first_batch_texts), len(enhanced_nodes), BATCH_SIZE):
+                batch_nodes = enhanced_nodes[start:start+BATCH_SIZE]
+                texts = [n.text for n in batch_nodes]
+                embeddings = []
+                for b in chunked_iter(texts, BATCH_SIZE):
+                    embeddings.extend(compute_embeddings_for_texts(b))
+                insert_batch_sqlalchemy(batch_nodes, embeddings)
+                total_inserted += len(batch_nodes)
+                logger.info("Inserted batch starting %d (%d rows).", start, len(batch_nodes))
+
+        logger.info("✅ Inserted %d rows into public.%s (SQLAlchemy path)", total_inserted, TABLE_FULLNAME)
+
+    logger.info("=== Indexing finished successfully ===")
 
 if __name__ == "__main__":
     main()
